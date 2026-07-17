@@ -1,0 +1,18 @@
+{
+  "name": "face-unlock-service",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "export": "next build && next export"
+  },
+  "dependencies": {
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "@tensorflow/tfjs": "latest",
+    "@vladmandic/face-api": "latest"
+  }
+}
