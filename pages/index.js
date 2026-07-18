@@ -2,27 +2,44 @@
 
 import { useEffect, useRef, useState } from 'react';
 
+const DETECTION_THRESHOLD = 0.6;
+
 export default function FaceUnlock() {
   const videoRef = useRef(null);
   const [mode, setMode] = useState('menu');
-  const [message, setMessage] = useState('Initializing...');
+  const [message, setMessage] = useState('Loading face detection...');
   const [enrolled, setEnrolled] = useState(0);
   const [stream, setStream] = useState(null);
+  const [faceapi, setFaceapi] = useState(null);
+  const [enrolledFaces, setEnrolledFaces] = useState([]);
 
+  // Load face-api models
   useEffect(() => {
-    setMessage('✅ Ready to enroll faces');
-    loadEnrolledCount();
+    loadModels();
+    loadEnrolledFaces();
   }, []);
 
-  const loadEnrolledCount = async () => {
+  const loadModels = async () => {
     try {
-      const db = await openDB();
-      const tx = db.transaction('faces', 'readonly');
-      const store = tx.objectStore('faces');
-      const req = store.getAll();
-      req.onsuccess = () => setEnrolled(req.result.length);
-    } catch (e) {
-      console.log('First time');
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/dist/face-api.min.js';
+      script.onload = async () => {
+        await window.faceapi.nets.tinyFaceDetector.loadFromUri(
+          'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/model/'
+        );
+        await window.faceapi.nets.faceLandmark68Net.loadFromUri(
+          'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/model/'
+        );
+        await window.faceapi.nets.faceRecognitionNet.loadFromUri(
+          'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/model/'
+        );
+        setFaceapi(window.faceapi);
+        setMessage('✅ Ready - Click Enroll or Verify');
+      };
+      script.onerror = () => setMessage('❌ Failed to load face detection');
+      document.body.appendChild(script);
+    } catch (err) {
+      setMessage('❌ Error loading models');
     }
   };
 
@@ -40,6 +57,21 @@ export default function FaceUnlock() {
     });
   };
 
+  const loadEnrolledFaces = async () => {
+    try {
+      const db = await openDB();
+      const tx = db.transaction('faces', 'readonly');
+      const store = tx.objectStore('faces');
+      const req = store.getAll();
+      req.onsuccess = () => {
+        setEnrolledFaces(req.result);
+        setEnrolled(req.result.length);
+      };
+    } catch (err) {
+      console.log('No faces enrolled');
+    }
+  };
+
   const startCamera = async () => {
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -51,7 +83,7 @@ export default function FaceUnlock() {
       setStream(mediaStream);
       return true;
     } catch (err) {
-      setMessage('❌ Camera permission denied or not available');
+      setMessage('❌ Camera permission denied');
       return false;
     }
   };
@@ -63,28 +95,73 @@ export default function FaceUnlock() {
     }
   };
 
+  // Detect face in video
+  const detectFace = async (video) => {
+    if (!faceapi || !video) return null;
+    
+    try {
+      const detection = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+      
+      return detection;
+    } catch (err) {
+      console.error('Detection error:', err);
+      return null;
+    }
+  };
+
   const handleEnroll = async () => {
+    if (!faceapi) {
+      setMessage('⚠️ Models still loading...');
+      return;
+    }
     setMessage('📷 Opening camera...');
     const ok = await startCamera();
     if (ok) {
-      setMessage('Position your face and click Capture');
+      setMessage('Position your face in frame and click Capture';
       setMode('enroll');
     }
   };
 
   const captureEnroll = async () => {
-    setMessage('✅ Face enrolled!');
+    if (!videoRef.current) return;
+    
+    setMessage('🔍 Detecting face...';
+    const detection = await detectFace(videoRef.current);
+
+    if (!detection) {
+      setMessage('❌ No face detected! Position your face clearly.');
+      return;
+    }
+
+    // Save face to IndexedDB
     const db = await openDB();
     const tx = db.transaction('faces', 'readwrite');
-    tx.objectStore('faces').add({ id: Date.now(), data: 'face_' + Date.now() });
-    setEnrolled(enrolled + 1);
-    stopCamera();
-    setTimeout(() => setMode('menu'), 2000);
+    const store = tx.objectStore('faces');
+    
+    store.add({
+      id: Date.now(),
+      descriptor: Array.from(detection.descriptor),
+      timestamp: new Date()
+    });
+
+    tx.oncomplete = async () => {
+      setMessage('✅ Face enrolled successfully!');
+      await loadEnrolledFaces();
+      stopCamera();
+      setTimeout(() => setMode('menu'), 2000);
+    };
   };
 
   const handleVerify = async () => {
     if (enrolled === 0) {
-      setMessage('⚠️ Enroll a face first');
+      setMessage('⚠️ No faces enrolled. Enroll first.');
+      return;
+    }
+    if (!faceapi) {
+      setMessage('⚠️ Models still loading...');
       return;
     }
     setMessage('🔒 Opening camera...');
@@ -96,12 +173,49 @@ export default function FaceUnlock() {
   };
 
   const doVerify = async () => {
-    setMessage('✅ Face verified! Access granted.');
-    if (window.parent) {
-      window.parent.postMessage({ type: 'FACE_UNLOCK_SUCCESS', confidence: 0.95 }, '*');
+    if (!videoRef.current) return;
+
+    setMessage('🔍 Detecting face...';
+    const detection = await detectFace(videoRef.current);
+
+    if (!detection) {
+      setMessage('❌ No face detected!');
+      return;
     }
-    stopCamera();
-    setTimeout(() => setMode('menu'), 2000);
+
+    // Compare with enrolled faces
+    let bestMatch = { distance: Infinity };
+
+    for (let enrolled of enrolledFaces) {
+      const enrolledDescriptor = new Float32Array(enrolled.descriptor);
+      const distance = window.faceapi.euclideanDistance(
+        detection.descriptor,
+        enrolledDescriptor
+      );
+
+      if (distance < bestMatch.distance) {
+        bestMatch = { distance, enrolled };
+      }
+    }
+
+    const confidence = 1 - bestMatch.distance;
+
+    if (bestMatch.distance < DETECTION_THRESHOLD) {
+      setMessage(`✅ Face verified! Match: ${(confidence * 100).toFixed(0)}%`);
+      
+      // Send success to parent app
+      if (window.parent) {
+        window.parent.postMessage({
+          type: 'FACE_UNLOCK_SUCCESS',
+          confidence: confidence
+        }, '*');
+      }
+
+      stopCamera();
+      setTimeout(() => setMode('menu'), 2000);
+    } else {
+      setMessage(`❌ No match found. Confidence: ${(confidence * 100).toFixed(0)}%`);
+    }
   };
 
   const handleReset = () => {
@@ -110,11 +224,12 @@ export default function FaceUnlock() {
   };
 
   const clearAll = async () => {
-    if (confirm('Delete all faces?')) {
+    if (confirm('Delete all enrolled faces?')) {
       const db = await openDB();
       const tx = db.transaction('faces', 'readwrite');
       tx.objectStore('faces').clear();
       setEnrolled(0);
+      setEnrolledFaces([]);
       setMessage('✅ All faces cleared');
     }
   };
@@ -123,7 +238,7 @@ export default function FaceUnlock() {
     <div style={styles.container}>
       <div style={styles.header}>
         <h1>🔓 Face Unlock</h1>
-        <p style={styles.subtitle}>Offline face auth</p>
+        <p style={styles.subtitle}>Real face detection</p>
       </div>
 
       {mode === 'menu' && (
@@ -132,14 +247,14 @@ export default function FaceUnlock() {
             <p>Enrolled: <strong>{enrolled}</strong></p>
           </div>
 
-          <button style={styles.button} onClick={handleEnroll}>
+          <button style={styles.button} onClick={handleEnroll} disabled={!faceapi}>
             📸 Enroll Face
           </button>
 
           <button 
             style={{...styles.button, opacity: enrolled ? 1 : 0.5}}
             onClick={handleVerify} 
-            disabled={enrolled === 0}
+            disabled={enrolled === 0 || !faceapi}
           >
             🔒 Verify Face
           </button>
